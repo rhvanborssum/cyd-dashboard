@@ -69,6 +69,7 @@ bool knownWifiConnect() {
   for (int i = 0; i < n && i < MAX_NETWORKS; i++) {
     ssids[i] = p.getString(ssidKey(i).c_str(), "");
     passes[i] = p.getString(passKey(i).c_str(), "");
+    Serial.printf("wifi: known network \"%s\"\n", ssids[i].c_str());
   }
   p.end();
   if (n == 0) return false;
