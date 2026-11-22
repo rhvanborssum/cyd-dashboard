@@ -623,6 +623,7 @@ void enterDashboard() {
 //   a / n / t / c = season auto / none / thanksgiving / christmas
 //   u = check for a firmware update now   v = print firmware version
 //   i = toggle colour inversion (saved)   k = toggle corgis in the rotation (saved)
+//   b = simulated tap (throw the ball / drop fish food)
 bool holdScreen = false;
 bool otaCheckRequested = false;
 
@@ -637,6 +638,9 @@ void handleSerial() {
       case 's':
         if (mode != MODE_SCENE) enterScene(nextScene);
         if (mode == MODE_SCENE) SCENES[scene].capture();
+        break;
+      case 'b':  // simulated tap near the back of the screen (throws the ball / drops food)
+        if (mode == MODE_SCENE) SCENES[scene].tap(160, 196);
         break;
       case 'u': otaCheckRequested = true; break;
       case 'v': Serial.printf("firmware v%d\n", FW_VERSION); break;

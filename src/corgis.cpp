@@ -39,11 +39,11 @@ uint16_t mix(uint16_t a, uint16_t b, float t) {
 }
 
 // ---------- Corgi sprites (facing right) ----------
-// O coat  W white  w paw  P tongue  E eye  N nose  C collar  T tag  . clear
+// O coat  W white  w paw  I inner ear  P tongue  E eye  N nose  C collar  T tag  . clear
 const char *const BODY[14] = {
     "..................O...O...",
-    ".................OP..OP...",
-    ".................OPO.OPO..",
+    ".................OI..OI...",
+    ".................OIO.OIO..",
     "................OOOOOOO...",
     "...............OOOOOOOOO..",
     "...............OOOOOEOOO..",
@@ -64,8 +64,8 @@ const char *const LEGS[4][3] = {
 };
 const char *const SIT[17] = {
     "..................O...O...",
-    ".................OP..OP...",
-    ".................OPO.OPO..",
+    ".................OI..OI...",
+    ".................OIO.OIO..",
     "................OOOOOOO...",
     "...............OOOOOOOOO..",
     "...............OOOOOEOOO..",
@@ -81,6 +81,47 @@ const char *const SIT[17] = {
     ".....WWWOOOOWWW.WW........",
     ".....wwwwww.ww..ww........",
 };
+// Seen from behind (heading up the yard, away from us): ears, collar, fluffy rear
+const char *const BACK[14] = {
+    "........O......O..........",
+    ".......OOO....OOO.........",
+    ".......OOOO..OOOO.........",
+    ".......OOOOOOOOOO.........",
+    "........OOOOOOOO..........",
+    "........CCCCCCCC..........",
+    "......OOOOOOOOOOOO........",
+    ".....OOOOOOOOOOOOOO.......",
+    ".....OOOOOOOOOOOOOO.......",
+    ".....OOOOOOOOOOOOOO.......",
+    ".....OOOWWWWWWWWOOO.......",
+    ".....OWWWWWWWWWWWWO.......",
+    ".....WWWWWWWWWWWWWW.......",
+    "......WWWWW..WWWWW........",
+};
+// Seen from the front (coming toward us): face, white chest, collar tag
+const char *const FRONT[14] = {
+    "........O......O..........",
+    ".......OIO....OIO.........",
+    ".......OIOO..OOIO.........",
+    ".......OOOOOOOOOO.........",
+    ".......OOEOOOOEOO.........",
+    ".......OOOWWWWOOO.........",
+    "........OWWNNWWO..........",
+    ".........WWPPWW...........",
+    "........CCCTCCCC..........",
+    ".......OOWWWWWWOO.........",
+    "......OOOWWWWWWOOO........",
+    "......OOOWWWWWWOOO........",
+    "......OOOOWWWWOOOO........",
+    ".......OOOWWWWOOO.........",
+};
+const char *const LEGS_FB[4][3] = {
+    {"........WW....WW..........", "........WW....WW..........", "........ww....ww.........."},
+    {"........WW....WW..........", "........ww....WW..........", "..............ww.........."},
+    {"........WW....WW..........", "........WW....WW..........", "........ww....ww.........."},
+    {"........WW....WW..........", "........WW....ww..........", "........ww................"},
+};
+constexpr int FB_CENTER_COL = 12;  // middle of the front/back sprites
 
 enum CoatKind { COAT_RED, COAT_TRI, COAT_SABLE };
 struct Coat { CoatKind kind; uint16_t main, second, collar; };
@@ -91,10 +132,15 @@ const Coat COATS[N_CORGIS] = {
 };
 
 enum State { STAND, WALK, SIT_DOWN, SPLOOT, ZOOMIES, CHASE, FETCH, PROUD };
+enum View { VIEW_SIDE, VIEW_BACK, VIEW_FRONT };
+
+bool isMoving(State s) { return s == WALK || s == ZOOMIES || s == CHASE || s == FETCH; }
 
 struct Corgi {
   float x, y, tx, ty, speed;
-  int dir;
+  float mvx, mvy;  // smoothed velocity, drives facing and view
+  int dir;         // +1 right, -1 left (side view)
+  View view;
   State state;
   float stateT, stateDur, animT, labelT, blinkAt;
   const Coat *coat;
@@ -160,6 +206,10 @@ void setState(Corgi &c, State s, float dur) {
   c.state = s;
   c.stateT = 0;
   c.stateDur = dur;
+  if (!isMoving(s)) {
+    c.view = VIEW_SIDE;
+    c.mvx = c.mvy = 0;
+  }
   if (c.isRoux && (s == SIT_DOWN || s == PROUD)) c.labelT = 3;
 }
 
@@ -216,14 +266,27 @@ bool moveToward(Corgi &c, float speed, float dt) {
   float step = min(d, speed * dt);
   c.x += dx / d * step;
   c.y += dy / d * step;
-  if (fabsf(dx) > 1) c.dir = dx > 0 ? 1 : -1;
+  float k = min(1.0f, dt * 6);
+  c.mvx += (dx / d * speed - c.mvx) * k;
+  c.mvy += (dy / d * speed - c.mvy) * k;
+
+  float ax = fabsf(c.mvx), ay = fabsf(c.mvy);
+  // Only turn around once clearly heading the other way, so no left/right dithering
+  int want = c.mvx > 0 ? 1 : -1;
+  if (want != c.dir && ax > 10 && ax > 0.5f * ay + 10) c.dir = want;
+  // Mostly up or down the yard: show the back (going away) or the face (coming toward us)
+  if (c.view == VIEW_SIDE) {
+    if (ay > 1.6f * ax && ay > 12) c.view = c.mvy < 0 ? VIEW_BACK : VIEW_FRONT;
+  } else if (ax > 1.1f * ay) {
+    c.view = VIEW_SIDE;
+  } else if (ay > 12) {
+    c.view = c.mvy < 0 ? VIEW_BACK : VIEW_FRONT;
+  }
   return false;
 }
 
-void mouthPos(const Corgi &c, float &mx, float &my) {
-  mx = c.x + c.dir * 23;
-  my = c.y - (c.state == SIT_DOWN || c.state == PROUD ? 15 : 15);
-}
+// Where the ball sits when carried or dropped (ground position)
+float mouthX(const Corgi &c) { return c.view == VIEW_SIDE ? c.x + c.dir * 22 : c.x - 2; }
 
 void updateCorgi(Corgi &c, float dt) {
   c.stateT += dt;
@@ -246,10 +309,11 @@ void updateCorgi(Corgi &c, float dt) {
     case CHASE:
       c.animT += dt * 14;
       if (!ball.active || ball.holder) { setState(c, STAND, 1); break; }
-      c.tx = ball.x - c.dir * 22;  // line the mouth up with the ball
+      // Aim at the ball itself; the old mouth-offset target flipped with the facing
+      c.tx = ball.x;
       c.ty = ball.y;
       moveToward(c, 115, dt);
-      if (fabsf(ball.x - (c.x + c.dir * 22)) < 8 && fabsf(ball.y - c.y) < 6 && ball.z < 4) {
+      if (fabsf(ball.x - mouthX(c)) < 12 && fabsf(ball.y - c.y) < 8 && ball.z < 4) {
         ball.holder = &c;
         c.hasBall = true;
         setState(c, FETCH, 99);
@@ -262,10 +326,8 @@ void updateCorgi(Corgi &c, float dt) {
       if (moveToward(c, 45, dt)) {
         c.hasBall = false;
         ball.holder = nullptr;
-        float mx, my;
-        mouthPos(c, mx, my);
-        ball.x = mx;
-        ball.y = c.y + 1;
+        ball.x = mouthX(c);
+        ball.y = c.y + (c.view == VIEW_FRONT ? 3 : 1);
         ball.z = 0;
         ball.vx = ball.vy = ball.vz = 0;
         c.dir = c.x < W / 2 ? 1 : -1;
@@ -447,19 +509,20 @@ void drawDoghouse() {
   spr->drawCentreString("ROUX", dx, Y(base - 42), 1);
 }
 
-uint16_t pixelColor(char ch, int row, int col, const Corgi &c, bool blink, bool pant) {
+uint16_t pixelColor(char ch, int row, int col, const Corgi &c, bool blink, bool pant, View view) {
   const Coat &k = *c.coat;
   switch (ch) {
     case 'O': {
-      bool head = row <= 8 && col >= 14;
+      bool head = view == VIEW_SIDE ? row <= 8 && col >= 14 : row <= (view == VIEW_FRONT ? 7 : 4);
       if (k.kind == COAT_TRI) return shade(head ? k.main : k.second, light);
       if (k.kind == COAT_SABLE) return shade(!head && row <= 10 ? k.second : k.main, light);
       return shade(k.main, light);
     }
     case 'W': return shade(rgb(250, 246, 238), light);
+    case 'I': return shade(rgb(235, 160, 150), light);
     case 'w': return shade(rgb(205, 198, 188), light);
     case 'P': return pant ? shade(rgb(240, 105, 125), light) : shade(rgb(250, 246, 238), light);
-    case 'E': return blink ? pixelColor('O', row, col, c, false, false) : rgb(20, 16, 16);
+    case 'E': return blink ? pixelColor('O', row, col, c, false, false, view) : rgb(20, 16, 16);
     case 'N': return rgb(20, 16, 16);
     case 'C': return shade(k.collar, light);
     case 'T': return c.isRoux ? rgb(250, 205, 60) : shade(k.collar, light);
@@ -468,7 +531,8 @@ uint16_t pixelColor(char ch, int row, int col, const Corgi &c, bool blink, bool 
 }
 
 // Draw sprite rows [srcRow0, srcRow0 + n) with top-left at (left, top), mirrored if facing left
-void drawRows(const char *const *rows, int n, int srcRow0, int left, int top, const Corgi &c, bool blink, bool pant) {
+void drawRows(const char *const *rows, int n, int srcRow0, int left, int top, const Corgi &c, bool blink, bool pant,
+              View view = VIEW_SIDE) {
   for (int i = 0; i < n; i++) {
     int sy = top + i * S;
     if (sy + S <= bandTop || sy >= bandTop + BAND_H) continue;
@@ -479,11 +543,11 @@ void drawRows(const char *const *rows, int n, int srcRow0, int left, int top, co
       bool clear = true;
       uint16_t col = 0;
       if (sc < SW) {
-        int srcCol = c.dir > 0 ? sc : SW - 1 - sc;
+        int srcCol = view != VIEW_SIDE || c.dir > 0 ? sc : SW - 1 - sc;  // front/back are symmetric
         char ch = row[srcCol];
         if (ch != '.') {
           clear = false;
-          col = pixelColor(ch, srcRow0 + i, srcCol, c, blink, pant);
+          col = pixelColor(ch, srcRow0 + i, srcCol, c, blink, pant, view);
         }
       }
       if (runStart >= 0 && (clear || col != runCol)) {
@@ -524,7 +588,8 @@ void drawCorgi(const Corgi &c) {
   int top = c.y - SH * S;
   if (!inBand(top - 40, c.y + 4)) return;
 
-  bool moving = c.state == WALK || c.state == ZOOMIES || c.state == CHASE || c.state == FETCH;
+  bool moving = isMoving(c.state);
+  bool fb = moving && c.view != VIEW_SIDE;  // front or back view
   bool sitting = c.state == SIT_DOWN || c.state == PROUD;
   bool blink = simT >= c.blinkAt && simT < c.blinkAt + 0.15f;
   bool pant = !c.hasBall && (sitting || c.state == ZOOMIES || c.state == CHASE || c.state == STAND) &&
@@ -533,7 +598,7 @@ void drawCorgi(const Corgi &c) {
   int bob = moving && (frame == 1 || frame == 3) ? -1 : 0;
   if (c.state == ZOOMIES || c.state == CHASE) frame = frame & 1 ? 1 : 3;
 
-  if (inBand(c.y - 3, c.y + 3)) spr->fillEllipse(c.x, Y(c.y + 1), 22, 3, shade(rgb(65, 135, 50), light));
+  if (inBand(c.y - 3, c.y + 3)) spr->fillEllipse(c.x, Y(c.y + 1), fb ? 14 : 22, 3, shade(rgb(65, 135, 50), light));
 
   int rowShift = 0;
   if (sitting) {
@@ -544,6 +609,9 @@ void drawCorgi(const Corgi &c) {
     // Back legs stretched out behind
     int px = c.dir > 0 ? left - 2 * S : left + SW * S;
     if (inBand(c.y - 4, c.y)) spr->fillRect(px, Y(c.y - 2 * S), 2 * S, 2 * S, shade(rgb(205, 198, 188), light));
+  } else if (fb) {
+    drawRows(c.view == VIEW_BACK ? BACK : FRONT, 14, 0, left, top + bob * S, c, blink, pant, c.view);
+    drawRows(LEGS_FB[frame], 3, 14, left, top + 14 * S, c, blink, pant, c.view);
   } else {
     drawRows(BODY, 14, 0, left, top + bob * S, c, blink, pant);
     drawRows(LEGS[frame], 3, 14, left, top + 14 * S, c, blink, pant);
@@ -556,14 +624,15 @@ void drawCorgi(const Corgi &c) {
   }
 
   int headTop = top + (sitting ? 0 : rowShift + bob) * S + 3 * S;
-  int hx = left + (c.dir > 0 ? 20 : 5) * S + S / 2;
+  int hx = fb ? left + FB_CENTER_COL * S : left + (c.dir > 0 ? 20 : 5) * S + S / 2;
   if (season == SEASON_CHRISTMAS) drawSantaHat(hx, Y(headTop + 1), c.dir);
   else if (season == SEASON_THANKSGIVING && c.isRoux) drawPilgrimHat(spr, hx, Y(headTop + 1), 0.8f);
 
-  if (c.hasBall) {
-    int mx = left + (c.dir > 0 ? 24 : 1) * S + 1;
-    drawBall(mx, top + (bob + 9) * S);
-  }
+  if (c.hasBall && c.view == VIEW_FRONT && fb) {
+    drawBall(left + FB_CENTER_COL * S, top + (bob + 8) * S);  // ball in the mouth, facing us
+  } else if (c.hasBall && !fb) {
+    drawBall(left + (c.dir > 0 ? 24 : 1) * S + 1, top + (bob + 9) * S);
+  }  // seen from behind, the ball is hidden by the head
   if (c.isRoux && c.labelT > 0 && sitting) {
     int ly = headTop - (season != SEASON_NONE ? 30 : 18);
     if (inBand(ly, ly + 12)) drawLabel(hx, Y(ly));
