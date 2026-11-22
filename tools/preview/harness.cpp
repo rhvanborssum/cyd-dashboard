@@ -165,7 +165,9 @@ int main(int argc, char **argv) {
     return 2;
   }
   std::string scene = argv[1];
-  char season = argv[2][0];
+  const char *seasonArg = argv[2];
+  int wxCode = -1;
+  float wxTemp = 70;
   int Y, Mo, D, h, mi;
   sscanf(argv[3], "%d-%d-%d", &Y, &Mo, &D);
   sscanf(argv[4], "%d:%d", &h, &mi);
@@ -181,6 +183,7 @@ int main(int argc, char **argv) {
   for (int i = 8; i < argc; i++) {
     Tap t;
     if (sscanf(argv[i], "tap=%d:%d:%d", &t.frame, &t.x, &t.y) == 3) taps.push_back(t);
+    sscanf(argv[i], "weather=%d:%f", &wxCode, &wxTemp);  // real-weather code and temperature (F)
   }
 
   tm t = {};
@@ -190,11 +193,15 @@ int main(int argc, char **argv) {
   t.tm_hour = h;
   t.tm_min = mi;
   mktime(&t);
-  setSeasonOverride(season == 'a' ? -1 : season == 'n' ? SEASON_NONE : season == 't' ? SEASON_THANKSGIVING : SEASON_CHRISTMAS);
+  // Season: a / n / t / c, or a number from season.h
+  char sc = seasonArg[0];
+  setSeasonOverride(sc >= '0' && sc <= '9' ? atoi(seasonArg)
+                    : sc == 'a' ? -1 : sc == 'n' ? SEASON_NONE : sc == 't' ? SEASON_THANKSGIVING : SEASON_CHRISTMAS);
 
   bool fish = scene == "fish";
   TFT_eSPI tft;
   if (!(fish ? aquariumBegin(tft) : corgiBegin(tft))) return 1;
+  if (!fish) corgiSetWeather(wxCode, wxTemp);
   int last = 0;
   for (int s : shots) last = max(last, s);
   for (int f = 1; f <= last; f++) {

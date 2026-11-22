@@ -9,7 +9,8 @@ Usage:
       --tap 30:110:205 --scale 2 --out corgis.png
   py -3.12 tools/preview.py fish --season c
 
-  --season a|n|t|c   auto (from --date) / none / thanksgiving / christmas
+  --season a|n|t|c|N auto (from --date) / none / thanksgiving / christmas, or a number from src/season.h
+  --weather CODE:TEMP real weather for the corgi yard (WMO code, degrees F), e.g. 61:50 for rain
   --tap F:X:Y        tap the screen at (X, Y) on frame F (repeatable)
 Frames run at ~22 fps, so frame 22 is about one second in.
 """
@@ -71,6 +72,7 @@ def main():
     ap.add_argument("--seed", default="1")
     ap.add_argument("--frames", default="30,90")
     ap.add_argument("--tap", action="append", default=[])
+    ap.add_argument("--weather", default=None)
     ap.add_argument("--scale", type=int, default=1)
     ap.add_argument("--cols", type=int, default=2)
     ap.add_argument("--out", default=str(OUT / "preview.png"))
@@ -79,7 +81,7 @@ def main():
     exe = build()
     prefix = OUT / f"{a.scene}"
     frames = [int(f) for f in a.frames.split(",")]
-    args = [str(exe), a.scene, a.season, a.date, a.time, a.seed, str(prefix), a.frames] + [f"tap={t}" for t in a.tap]
+    args = [str(exe), a.scene, a.season, a.date, a.time, a.seed, str(prefix), a.frames] + [f"tap={t}" for t in a.tap] + ([f"weather={a.weather}"] if a.weather else [])
     r = subprocess.run(args, capture_output=True, text=True)
     if r.returncode != 0:
         sys.exit(f"preview run failed ({r.returncode}): {r.stderr[-2000:]}")

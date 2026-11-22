@@ -42,6 +42,7 @@ static const City CITIES[2] = {
 static const uint32_t WEATHER_INTERVAL_MS = 10UL * 60 * 1000;
 static const uint32_t QUOTE_INTERVAL_MS = 2UL * 60 * 1000;
 static const uint32_t RETRY_INTERVAL_MS = 30UL * 1000;
+static const uint32_t YARD_WX_INTERVAL_MS = 15UL * 60 * 1000;  // real weather for the corgi yard
 static const uint32_t OTA_INTERVAL_MS = 6UL * 60 * 60 * 1000;  // update check
 static const uint32_t HEALTHY_AFTER_MS = 2UL * 60 * 1000;     // new firmware "proven"
 static const int BOOT_BUTTON = 0;
@@ -120,14 +121,30 @@ bool corgisEnabled = false;
 int onlyScene = -1;  // >= 0: show just this scene, full time (no dashboard)
 uint32_t lastOtaMs = 0;
 
+// Where this board lives: real weather in the corgi yard, the clock's time zone,
+// and Roux's birthday. Set over USB before a board leaves (serial L / Z / R).
+float homeLat = 29.7604f, homeLon = -95.3698f;  // default: Houston
+String tzInfo = TZ_INFO;
+int birthMonth = 0, birthDay = 0;  // 0 = not known yet
+uint32_t lastYardWxMs = 0;
+bool yardWxDue = true, yardWxOverride = false;
+
 void loadDeviceSettings() {
   Preferences p;
   p.begin("device", true);
   invertColours = p.getBool("invert", INVERT_DEFAULT);
   corgisEnabled = p.getBool("corgis", false);
   onlyScene = p.getInt("only", -1);
+  if (p.isKey("lat")) homeLat = p.getFloat("lat");
+  if (p.isKey("lon")) homeLon = p.getFloat("lon");
+  if (p.isKey("tz")) tzInfo = p.getString("tz");
+  birthMonth = p.getUChar("bmon", 0);
+  birthDay = p.getUChar("bday", 0);
   p.end();
+  setBirthday(birthMonth, birthDay);
 }
+
+const char *apName() { return onlyScene == 1 ? "Corgi-Yard" : "CYD-Dashboard"; }
 
 void saveDeviceSetting(const char *key, bool value) {
   Preferences p;
@@ -223,6 +240,23 @@ bool fetchWeather() {
     weather[i].lo = daily["temperature_2m_min"][0];
     weather[i].valid = true;
   }
+  return true;
+}
+
+// Current conditions where the board lives, for the corgi yard
+bool fetchYardWeather() {
+  String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(homeLat, 4) +
+               "&longitude=" + String(homeLon, 4) + "&current=temperature_2m,weather_code&temperature_unit=fahrenheit";
+  String body;
+  if (!httpGet(url, body)) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) return false;
+  JsonObject cur = doc["current"];
+  if (cur.isNull()) return false;
+  int code = cur["weather_code"] | -1;
+  float temp = cur["temperature_2m"] | 70.0f;
+  corgiSetWeather(code, temp);
+  Serial.printf("yard weather: code %d, %.0fF\n", code, temp);
   return true;
 }
 
@@ -520,6 +554,8 @@ void setup() {
   }
   Serial.printf("board: %s, invert %s, corgis %s, only %s\n", BOARD_NAME, invertColours ? "on" : "off",
                 corgisEnabled ? "on" : "off", onlyScene >= 0 ? SCENES[onlyScene].name : "-");
+  Serial.printf("home: %.4f, %.4f  tz: %s  birthday: %d-%d\n", homeLat, homeLon, tzInfo.c_str(), birthMonth,
+                birthDay);
 
   // Take over the backlight pin with PWM so it can be dimmed
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -542,7 +578,7 @@ void setup() {
     knownWifiRememberSaved();
   }
   wm.setAPCallback([](WiFiManager *) {
-    showMessage("Wi-Fi setup", "On your phone, join Wi-Fi \"CYD-Dashboard\"",
+    showMessage("Wi-Fi setup", String("On your phone, join Wi-Fi \"") + apName() + "\"",
                 "then pick your home network");
   });
   showMessage("Connecting", "Joining saved Wi-Fi...", "firmware v" + String(FW_VERSION));
@@ -550,12 +586,12 @@ void setup() {
     // With networks on file, retry after a while rather than waiting in setup
     // forever, in case the router was just briefly down
     if (knownWifiCount() > 0) wm.setConfigPortalTimeout(300);
-    if (!wm.autoConnect("CYD-Dashboard")) ESP.restart();
+    if (!wm.autoConnect(apName())) ESP.restart();
   }
   knownWifiRememberConnected();
 
   showMessage("Connected", WiFi.SSID(), "Syncing time...");
-  configTzTime(TZ_INFO, "pool.ntp.org", "time.nist.gov");
+  configTzTime(tzInfo.c_str(), "pool.ntp.org", "time.nist.gov");
   while (!getLocalTime(&t, 1000)) Serial.println("waiting for NTP");
 
   showMessage("Connected", WiFi.SSID(), "Checking for updates...");
@@ -635,6 +671,11 @@ void enterDashboard() {
 //   u = check for a firmware update now   v = print firmware version
 //   i = toggle colour inversion (saved)   k = toggle corgis in the rotation (saved)
 //   b = simulated tap (throw the ball / drop fish food)
+// Line commands (end with Enter), saved on the board unless noted:
+//   L29.7604,-95.3698  home location for real weather     Z<POSIX TZ>  time zone, e.g. ZEST5EDT,M3.2.0,M11.1.0
+//   R07-15  Roux's birthday (R0 = unknown)                 S<n>  try season n from season.h, S-1 = calendar (not saved)
+//   W63,55  pretend weather code,tempF (not saved)          W-1   back to real weather
+//   ?  print this board's settings
 //   o = toggle corgis-only mode: corgis full time, no dashboard (saved)
 bool holdScreen = false;
 bool otaCheckRequested = false;
@@ -675,6 +716,82 @@ void handleSerial() {
         if (!sceneEnabled(nextScene)) nextScene = nextEnabledScene(nextScene);
         Serial.printf("corgis: %s (saved)\n", corgisEnabled ? "on" : "off");
         break;
+      case 'L': {
+        String v = Serial.readStringUntil('\n');
+        int comma = v.indexOf(',');
+        if (comma < 0) {
+          Serial.println("usage: L<lat>,<lon>");
+          break;
+        }
+        homeLat = v.substring(0, comma).toFloat();
+        homeLon = v.substring(comma + 1).toFloat();
+        Preferences p;
+        p.begin("device", false);
+        p.putFloat("lat", homeLat);
+        p.putFloat("lon", homeLon);
+        p.end();
+        yardWxDue = true;
+        Serial.printf("home: %.4f, %.4f (saved)\n", homeLat, homeLon);
+        break;
+      }
+      case 'Z': {
+        String v = Serial.readStringUntil('\n');
+        v.trim();
+        if (!v.length()) break;
+        tzInfo = v;
+        Preferences p;
+        p.begin("device", false);
+        p.putString("tz", tzInfo);
+        p.end();
+        setenv("TZ", tzInfo.c_str(), 1);
+        tzset();
+        Serial.printf("time zone: %s (saved)\n", tzInfo.c_str());
+        break;
+      }
+      case 'R': {
+        String v = Serial.readStringUntil('\n');
+        int dash = v.indexOf('-');
+        int m = v.toInt(), d = dash >= 0 ? v.substring(dash + 1).toInt() : 0;
+        if (m < 1 || m > 12 || d < 1 || d > 31) m = d = 0;  // "R0" (or anything invalid) clears it
+        birthMonth = m;
+        birthDay = d;
+        Preferences p;
+        p.begin("device", false);
+        p.putUChar("bmon", m);
+        p.putUChar("bday", d);
+        p.end();
+        setBirthday(m, d);
+        Serial.printf("birthday: %d-%d (saved)\n", m, d);
+        break;
+      }
+      case 'S': {
+        int n = Serial.readStringUntil('\n').toInt();
+        setSeasonOverride(n >= 0 && n < SEASON_COUNT ? n : -1);
+        struct tm t;
+        getLocalTime(&t, 0);
+        Serial.printf("season: %s%s\n", seasonName(currentSeason(t)), n < 0 ? " (calendar)" : "");
+        break;
+      }
+      case 'W': {
+        String v = Serial.readStringUntil('\n');
+        int code = v.toInt(), comma = v.indexOf(',');
+        if (code >= 0) {
+          yardWxOverride = true;
+          corgiSetWeather(code, comma >= 0 ? v.substring(comma + 1).toFloat() : 70);
+          Serial.printf("weather: pretending code %d\n", code);
+        } else {
+          yardWxOverride = false;
+          yardWxDue = true;
+          Serial.println("weather: real");
+        }
+        break;
+      }
+      case '?':
+        Serial.printf("firmware v%d, board %s, invert %s, corgis %s, only %d\n", FW_VERSION, BOARD_NAME,
+                      invertColours ? "on" : "off", corgisEnabled ? "on" : "off", onlyScene);
+        Serial.printf("home: %.4f, %.4f  tz: %s  birthday: %d-%d\n", homeLat, homeLon, tzInfo.c_str(), birthMonth,
+                      birthDay);
+        break;
       case 'a': case 'n': case 't': case 'c': {
         setSeasonOverride(c == 'a' ? -1 : c == 'n' ? SEASON_NONE : c == 't' ? SEASON_THANKSGIVING : SEASON_CHRISTMAS);
         struct tm t;
@@ -684,6 +801,15 @@ void handleSerial() {
       }
     }
   }
+}
+
+// Refresh the corgi yard's real weather every 15 minutes (only on boards that show corgis)
+void updateYardWeather() {
+  if (yardWxOverride || !(corgisEnabled || onlyScene == 1)) return;
+  if (!yardWxDue && millis() - lastYardWxMs < YARD_WX_INTERVAL_MS) return;
+  bool ok = WiFi.isConnected() && fetchYardWeather();
+  lastYardWxMs = ok ? millis() : millis() - YARD_WX_INTERVAL_MS + 2 * 60 * 1000;  // retry in 2 min
+  yardWxDue = false;
 }
 
 void maintainWifi(uint32_t ms) {
@@ -727,6 +853,7 @@ void loop() {
         lastOtaMs = millis();
         otaCheckForUpdate(tft);  // reboots if it installs something
       }
+      updateYardWeather();  // a brief pause every 15 minutes
       maintainWifi(ms);
       return;
     }
@@ -780,6 +907,7 @@ void loop() {
     drawTicker();
   }
 
+  updateYardWeather();
   maintainWifi(ms);
   delay(20);
 }

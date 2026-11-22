@@ -11,3 +11,6 @@ void corgiEnd();
 void corgiFrame(const tm &t);
 void corgiTap(int x, int y);     // throw the ball toward this spot
 void corgiCaptureNextFrame();    // stream next frame over Serial (tools/screenshot.py)
+// Real weather where the board lives: WMO code (-1 = unknown) and temperature in F.
+// Shows rain, snow, grey skies, lightning, and breath on cold days.
+void corgiSetWeather(int wmoCode, float tempF);
