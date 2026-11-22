@@ -1,15 +1,14 @@
 #include "aquarium.h"
+
 #include <Arduino.h>
+
+#include "scene_common.h"
 
 namespace {
 
 constexpr int W = 320, H = 240;
 constexpr int BAND_H = 40;  // 320x40x16bit = 25.6 KB strip buffer
 constexpr int N_FISH = 7, N_BUBBLES = 40, N_FOOD = 24, N_WEED = 8, N_PEBBLES = 45;
-
-constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-}
 
 TFT_eSPI *tft = nullptr;
 TFT_eSprite *spr = nullptr;
@@ -50,25 +49,12 @@ const float CHEST_X = 262, CHEST_Y = 194;
 float nextBurst = 2, burstEnd = 0, nextBubble = 0;
 
 // ---------- Seasons ----------
-int seasonOverride = -1;
 Season season = SEASON_NONE;
 bool captureNext = false;
 int largestFish = 0;  // wears the pilgrim hat
 
 struct Diver { float x, y, vx, targetY, phase, facing, nextBubble; };
 Diver santa;
-
-// 4th Thursday of November
-int thanksgivingDay(int year) {
-  tm nov1 = {};
-  nov1.tm_year = year - 1900;
-  nov1.tm_mon = 10;
-  nov1.tm_mday = 1;
-  nov1.tm_hour = 12;
-  mktime(&nov1);  // fills in tm_wday
-  int firstThu = 1 + (4 - nov1.tm_wday + 7) % 7;
-  return firstThu + 21;
-}
 
 // Mirror an x offset for something facing left (-1) or right (+1)
 inline int MX(float x, float dir, float ox) { return x + dir * ox; }
@@ -283,23 +269,6 @@ void drawSand() {
     if (inBand(p.y - p.r, p.y + p.r)) spr->fillCircle(p.x, Y(p.y), p.r, p.col);
 }
 
-void drawPilgrimHat(float hx, float baseY, float s) {
-  uint16_t black = rgb(28, 26, 30), band = rgb(70, 65, 70), gold = rgb(240, 195, 60);
-  int brimW = 20 * s, crownW = 12 * s, crownH = 13 * s;
-  int by = Y(baseY);
-  // Crown tapers slightly toward the top
-  for (int r = 0; r < crownH; r++) {
-    int w = crownW - (r * 3 * s) / crownH;
-    spr->drawFastHLine(hx - w / 2, by - 2 - r, w, black);
-  }
-  spr->fillRect(hx - brimW / 2, by - 2, brimW, max(2.0f, 3 * s), black);
-  int bandH = max(2.0f, 3 * s);
-  spr->fillRect(hx - crownW / 2, by - 4 - bandH, crownW, bandH, band);
-  int bk = max(3.0f, 5 * s);
-  spr->drawRect(hx - bk / 2, by - 4 - bandH - 1, bk, bandH + 2, gold);
-  spr->drawRect(hx - bk / 2 + 1, by - 4 - bandH, bk - 2, bandH, gold);
-}
-
 void drawChristmasLights(const Fish &f, float L, float h, float dir, int cx, int cy, int idx) {
   const uint16_t onCol[2] = {rgb(255, 40, 40), rgb(40, 255, 70)};
   const uint16_t offCol[2] = {rgb(90, 20, 20), rgb(20, 80, 30)};
@@ -437,7 +406,7 @@ void drawFish(const Fish &f, int idx) {
   if (season == SEASON_CHRISTMAS) drawChristmasLights(f, L, h, dir, cx, cy, idx);
   if (season == SEASON_THANKSGIVING && idx == largestFish) {
     float t = 0.3f;  // sits just behind the eye
-    drawPilgrimHat(cx + dir * L * t, f.y - h * sqrtf(1 - t * t) * 0.95f + 1, f.size / 18.0f);
+    drawPilgrimHat(spr, cx + dir * L * t, Y(f.y - h * sqrtf(1 - t * t) * 0.95f + 1), f.size / 18.0f);
   }
 }
 
@@ -475,6 +444,9 @@ bool aquariumBegin(TFT_eSPI &display) {
       spr = nullptr;
       return false;
     }
+    // New sprites leave TFT_eSPI's free-font pointer uninitialised; this clears it.
+    // Without it, drawing in font 1 reads a garbage pointer and crashes.
+    spr->setTextFont(1);
   }
   initScene();
   lastMs = millis();
@@ -500,27 +472,13 @@ void aquariumTap(int x, int y) {
   }
 }
 
-Season aquariumSeason(const tm &t) {
-  if (seasonOverride >= 0) return (Season)seasonOverride;
-  int tg = thanksgivingDay(t.tm_year + 1900);
-  if (t.tm_mon == 10 && t.tm_mday <= tg) return SEASON_THANKSGIVING;  // Nov 1 - Thanksgiving
-  if ((t.tm_mon == 10 && t.tm_mday > tg) || (t.tm_mon == 11 && t.tm_mday <= 25))
-    return SEASON_CHRISTMAS;  // day after Thanksgiving - Christmas Day
-  return SEASON_NONE;
-}
-
-const char *seasonName(Season s) {
-  return s == SEASON_THANKSGIVING ? "thanksgiving" : s == SEASON_CHRISTMAS ? "christmas" : "none";
-}
-
-void aquariumSetSeasonOverride(int s) { seasonOverride = s; }
 void aquariumCaptureNextFrame() { captureNext = true; }
 
 void aquariumFrame(const tm &t) {
   if (!spr) return;
   uint32_t now = millis();
   float dt = min(0.1f, (now - lastMs) / 1000.0f);
-  season = aquariumSeason(t);
+  season = currentSeason(t);
   update(dt);
 
   bool capture = captureNext;

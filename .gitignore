@@ -3,3 +3,4 @@ tools/board-id/.pio/
 cyd-reference/
 __pycache__/
 *.png
+backups/

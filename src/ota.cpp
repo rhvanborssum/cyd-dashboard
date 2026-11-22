@@ -7,6 +7,7 @@
 #include <WiFiClientSecure.h>
 #include <esp_ota_ops.h>
 
+#include "board.h"
 #include "ca_certs.h"
 #include "ota_config.h"
 #include "version.h"
@@ -24,7 +25,7 @@ void screen(TFT_eSPI &tft, const String &title, const String &line, uint16_t tit
 }
 }  // namespace
 
-bool otaEnabled() { return sizeof(OTA_MANIFEST_URL) > 1; }
+bool otaEnabled() { return sizeof(OTA_RELEASES_URL) > 1; }
 
 void otaBootCheck() {
   Preferences p;
@@ -74,7 +75,7 @@ void otaCheckForUpdate(TFT_eSPI &tft) {
     HTTPClient http;
     http.setTimeout(15000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!http.begin(client, OTA_MANIFEST_URL)) return;
+    if (!http.begin(client, OTA_RELEASES_URL OTA_MANIFEST_NAME)) return;
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
       Serial.printf("ota: manifest fetch -> %d\n", code);

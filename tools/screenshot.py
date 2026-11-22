@@ -1,7 +1,8 @@
 """Grab a screenshot of the CYD fish tank over USB serial and save it as a PNG.
 
-Usage: py -3.12 tools/screenshot.py [out.png] [season]
+Usage: py -3.12 tools/screenshot.py [out.png] [season] [scene]
   season (optional): a / n / t / c  (auto / none / thanksgiving / christmas)
+  scene (optional):  f = fish tank (default), p = corgis
 
 The board renders its next tank frame, streams the raw RGB565 pixels, and this
 script converts them. Takes ~15 s at 115200 baud. No extra Python packages needed.
@@ -46,7 +47,8 @@ def rgb565_rows(data, w, h):
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else "screenshot.png"
-    season = sys.argv[2] if len(sys.argv) > 2 else None
+    season = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "-" else None
+    scene = sys.argv[3] if len(sys.argv) > 3 else "f"
 
     ports = [p.device for p in list_ports.comports() if p.vid == CH340_VID]
     if not ports:
@@ -64,7 +66,7 @@ def main():
         if season:
             s.write(season.encode())
             time.sleep(1.0)  # let a few frames render with the new season
-        s.write(b"f")
+        s.write(scene.encode())
         time.sleep(1.5)  # let the tank settle in if we just switched to it
         s.reset_input_buffer()
         s.write(b"s")

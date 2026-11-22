@@ -9,6 +9,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <WiFiManager.h>
@@ -17,7 +18,10 @@
 #include <time.h>
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+#include "board.h"
 #include "aquarium.h"
+#include "corgis.h"
+#include "season.h"
 #include "ota.h"
 #include "version.h"
 #include "wifi_store.h"
@@ -57,12 +61,10 @@ static const int BL_CHANNEL = 0;
 // Screen cycling: dashboard for a minute, then the fish tank for a bit.
 // Tap the dashboard to jump to the tank early; tap the tank to feed the fish.
 static const uint32_t DASHBOARD_MS = 60UL * 1000;
-static const uint32_t AQUARIUM_MS = 20UL * 1000;
+static const uint32_t SCENE_MS = 20UL * 1000;
 
-// Resistive touch (XPT2046) on its own SPI bus; raw->screen calibration
+// CYD: resistive touch (XPT2046) on its own SPI bus. Calibration is in board.h.
 static const int T_IRQ = 36, T_MOSI = 32, T_MISO = 39, T_CLK = 25, T_CS = 33;
-static const int TOUCH_X_MIN = 200, TOUCH_X_MAX = 3700;
-static const int TOUCH_Y_MIN = 240, TOUCH_Y_MAX = 3800;
 
 // ---------- Colours ----------
 constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
@@ -80,12 +82,66 @@ static const uint16_t C_CLOUD = rgb(200, 205, 215);
 static const uint16_t C_RAIN = rgb(80, 150, 255);
 
 TFT_eSPI tft;
+#if !TOUCH_ON_TFT_BUS
 SPIClass touchSpi(VSPI);
 XPT2046_Touchscreen touch(T_CS, T_IRQ);
+#endif
 
-enum Mode { MODE_DASHBOARD, MODE_AQUARIUM };
+enum Mode { MODE_DASHBOARD, MODE_SCENE };
 Mode mode = MODE_DASHBOARD;
 uint32_t modeStartMs = 0;
+
+// Animated scenes take turns between dashboard stretches
+struct SceneOps {
+  const char *name;
+  bool (*begin)(TFT_eSPI &);
+  void (*end)();
+  void (*frame)(const tm &);
+  void (*tap)(int, int);
+  void (*capture)();
+};
+const SceneOps SCENES[] = {
+    {"fish tank", aquariumBegin, aquariumEnd, aquariumFrame, aquariumTap, aquariumCaptureNextFrame},
+    {"corgis", corgiBegin, corgiEnd, corgiFrame, corgiTap, corgiCaptureNextFrame},
+};
+const int N_SCENES = sizeof(SCENES) / sizeof(SCENES[0]);
+int scene = 0, nextScene = 0;
+
+// Per-board settings kept in flash, so one firmware suits every board:
+//   invert: colour inversion (CYD panels differ; the office board needs it on)
+//   corgis: include the corgi yard in the rotation (off unless switched on)
+#ifdef TFT_INVERSION_ON
+static const bool INVERT_DEFAULT = true;
+#else
+static const bool INVERT_DEFAULT = false;
+#endif
+bool invertColours = INVERT_DEFAULT;
+bool corgisEnabled = false;
+
+void loadDeviceSettings() {
+  Preferences p;
+  p.begin("device", true);
+  invertColours = p.getBool("invert", INVERT_DEFAULT);
+  corgisEnabled = p.getBool("corgis", false);
+  p.end();
+}
+
+void saveDeviceSetting(const char *key, bool value) {
+  Preferences p;
+  p.begin("device", false);
+  p.putBool(key, value);
+  p.end();
+}
+
+bool sceneEnabled(int i) { return i != 1 || corgisEnabled; }
+
+int nextEnabledScene(int after) {
+  for (int k = 1; k <= N_SCENES; k++) {
+    int i = (after + k) % N_SCENES;
+    if (sceneEnabled(i)) return i;
+  }
+  return 0;
+}
 
 // ---------- State ----------
 struct Weather {
@@ -438,9 +494,22 @@ void setup() {
   otaBootCheck();  // before anything else, so a crashing update can roll back
   Serial.printf("firmware v%d, self-update %s\n", FW_VERSION, otaEnabled() ? "on" : "off");
   pinMode(BOOT_BUTTON, INPUT_PULLUP);
+#ifdef AUDIO_ENABLE_PIN
+  pinMode(AUDIO_ENABLE_PIN, OUTPUT);
+  digitalWrite(AUDIO_ENABLE_PIN, HIGH);  // keep the speaker amp off (no hiss)
+#endif
   tft.init();
   tft.setRotation(1);
+  loadDeviceSettings();
+  tft.invertDisplay(invertColours);
   tft.fillScreen(C_BG);
+  if (UI_X || UI_Y) {
+    // Bigger screen: frame the 320x240 layout and confine all drawing to it
+    tft.drawRoundRect(UI_X - 3, UI_Y - 3, UI_W + 6, UI_H + 6, 6, C_CARD);
+    tft.setViewport(UI_X, UI_Y, UI_W, UI_H);
+  }
+  Serial.printf("board: %s, invert %s, corgis %s\n", BOARD_NAME, invertColours ? "on" : "off",
+                corgisEnabled ? "on" : "off");
 
   // Take over the backlight pin with PWM so it can be dimmed
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -483,51 +552,77 @@ void setup() {
   otaCheckForUpdate(tft);
 #endif
 
+#if !TOUCH_ON_TFT_BUS
   touchSpi.begin(T_CLK, T_MISO, T_MOSI, T_CS);
   touch.begin(touchSpi);
   touch.setRotation(1);
+#endif
 
   drawDashboard();
   modeStartMs = millis();
-  Serial.printf("season: %s\n", seasonName(aquariumSeason(t)));
+  Serial.printf("season: %s\n", seasonName(currentSeason(t)));
 }
 
 // Returns true once per new tap, with screen coordinates
 bool readTap(int &x, int &y) {
   static bool wasDown = false;
+#if TOUCH_ON_TFT_BUS
+  // Touch shares the display's SPI bus, so go through TFT_eSPI
+  bool down = tft.getTouchRawZ() > 350;
+#else
   bool down = touch.tirqTouched() && touch.touched();
+#endif
   bool tap = down && !wasDown;
   wasDown = down;
   if (!tap) return false;
+  int rx, ry;
+#if TOUCH_ON_TFT_BUS
+  uint16_t ux, uy;
+  tft.getTouchRaw(&ux, &uy);
+  rx = ux;
+  ry = uy;
+#else
   TS_Point p = touch.getPoint();
-  x = constrain(map(p.x, TOUCH_X_MIN, TOUCH_X_MAX, 0, 320), 0, 319);
-  y = constrain(map(p.y, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, 240), 0, 239);
-  Serial.printf("tap raw=(%d,%d) screen=(%d,%d)\n", p.x, p.y, x, y);
+  rx = p.x;
+  ry = p.y;
+#endif
+  int ax = TOUCH_SWAP_XY ? ry : rx, ay = TOUCH_SWAP_XY ? rx : ry;
+  int sx = map(ax, TOUCH_X_MIN, TOUCH_X_MAX, 0, SCREEN_W);
+  int sy = map(ay, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, SCREEN_H);
+  x = constrain(sx - UI_X, 0, UI_W - 1);  // into the 320x240 layout's coordinates
+  y = constrain(sy - UI_Y, 0, UI_H - 1);
+  Serial.printf("tap raw=(%d,%d) screen=(%d,%d) ui=(%d,%d)\n", rx, ry, sx, sy, x, y);
   return true;
 }
 
-void enterAquarium() {
-  if (!aquariumBegin(tft)) {
-    Serial.println("aquarium: not enough RAM, staying on dashboard");
+void enterScene(int i) {
+  if (mode == MODE_SCENE) SCENES[scene].end();
+  if (!SCENES[i].begin(tft)) {
+    Serial.printf("%s: not enough RAM, staying on dashboard\n", SCENES[i].name);
+    mode = MODE_DASHBOARD;
     modeStartMs = millis();
+    drawDashboard();
     return;
   }
-  mode = MODE_AQUARIUM;
+  scene = i;
+  nextScene = nextEnabledScene(i);
+  mode = MODE_SCENE;
   modeStartMs = millis();
 }
 
 void enterDashboard() {
-  aquariumEnd();  // hand the buffer's RAM back before any HTTPS calls
+  if (mode == MODE_SCENE) SCENES[scene].end();  // hand the buffer's RAM back before any HTTPS calls
   mode = MODE_DASHBOARD;
   modeStartMs = millis();
   drawDashboard();
 }
 
 // Single-letter serial commands, handy for testing from the PC:
-//   f = fish tank now   d = dashboard now   h = hold current screen (toggle)
-//   s = screenshot the tank (tools/screenshot.py)
+//   f = fish tank now   p = corgis (pups) now   d = dashboard now
+//   h = hold current screen (toggle)   s = screenshot the scene (tools/screenshot.py)
 //   a / n / t / c = season auto / none / thanksgiving / christmas
 //   u = check for a firmware update now   v = print firmware version
+//   i = toggle colour inversion (saved)   k = toggle corgis in the rotation (saved)
 bool holdScreen = false;
 bool otaCheckRequested = false;
 
@@ -535,20 +630,33 @@ void handleSerial() {
   while (Serial.available()) {
     char c = Serial.read();
     switch (c) {
-      case 'f': if (mode != MODE_AQUARIUM) enterAquarium(); break;
+      case 'f': if (mode != MODE_SCENE || scene != 0) enterScene(0); break;
+      case 'p': if (mode != MODE_SCENE || scene != 1) enterScene(1); break;
       case 'd': if (mode != MODE_DASHBOARD) enterDashboard(); break;
       case 'h': holdScreen = !holdScreen; Serial.printf("hold: %s\n", holdScreen ? "on" : "off"); break;
       case 's':
-        if (mode != MODE_AQUARIUM) enterAquarium();
-        aquariumCaptureNextFrame();
+        if (mode != MODE_SCENE) enterScene(nextScene);
+        if (mode == MODE_SCENE) SCENES[scene].capture();
         break;
       case 'u': otaCheckRequested = true; break;
       case 'v': Serial.printf("firmware v%d\n", FW_VERSION); break;
+      case 'i':
+        invertColours = !invertColours;
+        saveDeviceSetting("invert", invertColours);
+        tft.invertDisplay(invertColours);
+        Serial.printf("invert: %s (saved)\n", invertColours ? "on" : "off");
+        break;
+      case 'k':
+        corgisEnabled = !corgisEnabled;
+        saveDeviceSetting("corgis", corgisEnabled);
+        if (!sceneEnabled(nextScene)) nextScene = nextEnabledScene(nextScene);
+        Serial.printf("corgis: %s (saved)\n", corgisEnabled ? "on" : "off");
+        break;
       case 'a': case 'n': case 't': case 'c': {
-        aquariumSetSeasonOverride(c == 'a' ? -1 : c == 'n' ? SEASON_NONE : c == 't' ? SEASON_THANKSGIVING : SEASON_CHRISTMAS);
+        setSeasonOverride(c == 'a' ? -1 : c == 'n' ? SEASON_NONE : c == 't' ? SEASON_THANKSGIVING : SEASON_CHRISTMAS);
         struct tm t;
         getLocalTime(&t, 0);
-        Serial.printf("season: %s%s\n", seasonName(aquariumSeason(t)), c == 'a' ? " (auto)" : "");
+        Serial.printf("season: %s%s\n", seasonName(currentSeason(t)), c == 'a' ? " (auto)" : "");
         break;
       }
     }
@@ -577,19 +685,19 @@ void loop() {
   bool tapped = readTap(tx, ty);
   if (holdScreen) modeStartMs = ms;
 
-  if (mode == MODE_AQUARIUM) {
-    if (tapped) aquariumTap(tx, ty);
-    aquariumFrame(t);
-    if (millis() - modeStartMs >= AQUARIUM_MS) enterDashboard();
+  if (mode == MODE_SCENE) {
+    if (tapped) SCENES[scene].tap(tx, ty);
+    SCENES[scene].frame(t);
+    if (millis() - modeStartMs >= SCENE_MS) enterDashboard();
     return;  // no network work while animating, so frames never stall
   }
 
   if (tapped || ms - modeStartMs >= DASHBOARD_MS) {
-    enterAquarium();
-    if (mode == MODE_AQUARIUM) return;
+    enterScene(nextScene);
+    if (mode == MODE_SCENE) return;
   }
 
-  // Update checks run on the dashboard, when the aquarium's RAM is free
+  // Update checks run on the dashboard, when the scenes' RAM is free
   static uint32_t lastOtaMs = millis();
   if (otaCheckRequested || millis() - lastOtaMs >= OTA_INTERVAL_MS) {
     otaCheckRequested = false;

@@ -2,6 +2,7 @@
 // Prints results to serial at 115200.
 #include <Arduino.h>
 #include <SPI.h>
+#include <Wire.h>
 
 // Display (HSPI)
 static const int LCD_SCK = 14, LCD_MOSI = 13, LCD_MISO = 12, LCD_CS = 15, LCD_DC = 2, LCD_BL = 21;
@@ -85,6 +86,20 @@ void setup() {
   uint16_t t0 = touchRead(0x84), t1 = touchRead(0xF4);
   Serial.printf("XPT2046 temp0 / temp1:       %u / %u\n", t0, t1);
   Serial.printf("Touch IRQ pin (1=idle):      %d\n", digitalRead(T_IRQ));
+
+  // Capacitive touch controllers sit on I2C; try the pin pairs CYD variants use
+  const int pairs[][2] = {{33, 32}, {27, 22}};
+  for (auto &pr : pairs) {
+    Wire.begin(pr[0], pr[1]);
+    Serial.printf("I2C scan SDA=%d SCL=%d:      ", pr[0], pr[1]);
+    int found = 0;
+    for (uint8_t a = 1; a < 127; a++) {
+      Wire.beginTransmission(a);
+      if (Wire.endTransmission() == 0) { Serial.printf(" 0x%02X", a); found++; }
+    }
+    Serial.println(found ? "" : " none");
+    Wire.end();
+  }
   Serial.printf("Flash: %u MB, PSRAM: %u bytes\n", ESP.getFlashChipSize() >> 20, ESP.getPsramSize());
   Serial.println("===== END =====");
 }

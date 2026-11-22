@@ -21,7 +21,11 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 REPO = "cyd-dashboard"
-FIRMWARE = ROOT / ".pio" / "build" / "cyd" / "firmware.bin"
+# (PlatformIO env, firmware file name in the release, manifest the board reads)
+TARGETS = [
+    ("cyd", "firmware.bin", "manifest.json"),
+    ("e32r40t", "firmware-e32r40t.bin", "manifest-e32r40t.json"),
+]
 OUT_DIR = ROOT / ".pio" / "release"
 TRAILER = "\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
@@ -58,9 +62,10 @@ def commit_all(message):
 
 
 def build():
-    run(sys.executable, "-m", "platformio", "run")
-    if not FIRMWARE.exists():
-        sys.exit("build produced no firmware.bin")
+    for env, _, _ in TARGETS:
+        run(sys.executable, "-m", "platformio", "run", "-e", env)
+        if not (ROOT / ".pio" / "build" / env / "firmware.bin").exists():
+            sys.exit(f"build of {env} produced no firmware.bin")
 
 
 def release(login, notes):
@@ -69,12 +74,17 @@ def release(login, notes):
         sys.exit(f"Release v{v} already exists - bump FW_VERSION in src/version.h first.")
     build()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    manifest = OUT_DIR / "manifest.json"
-    url = f"https://github.com/{login}/{REPO}/releases/download/v{v}/firmware.bin"
-    manifest.write_text(json.dumps({"version": v, "url": url}, indent=2) + "\n")
+    assets = []
+    for env, fw_name, manifest_name in TARGETS:
+        fw = OUT_DIR / fw_name
+        fw.write_bytes((ROOT / ".pio" / "build" / env / "firmware.bin").read_bytes())
+        manifest = OUT_DIR / manifest_name
+        url = f"https://github.com/{login}/{REPO}/releases/download/v{v}/{fw_name}"
+        manifest.write_text(json.dumps({"version": v, "url": url}, indent=2) + "\n")
+        assets += [str(fw), str(manifest)]
     commit_all(f"Release v{v}: {notes}")
     run("git", "push", "-q", "origin", "main")
-    run("gh", "release", "create", f"v{v}", str(FIRMWARE), str(manifest),
+    run("gh", "release", "create", f"v{v}", *assets,
         "--title", f"v{v}", "--notes", notes, "--target", "main")
     print(f"\nPublished v{v}. The board will install it within 6 hours (or on restart).")
 
@@ -95,8 +105,8 @@ def setup():
     run("git", "config", "--add", helper, "!gh auth git-credential")
 
     cfg = ROOT / "src" / "ota_config.h"
-    url = f"https://github.com/{login}/{REPO}/releases/latest/download/manifest.json"
-    cfg.write_text(re.sub(r'#define OTA_MANIFEST_URL ".*"', f'#define OTA_MANIFEST_URL "{url}"', cfg.read_text()))
+    url = f"https://github.com/{login}/{REPO}/releases/latest/download/"
+    cfg.write_text(re.sub(r'#define OTA_RELEASES_URL ".*"', f'#define OTA_RELEASES_URL "{url}"', cfg.read_text()))
     print(f"Update URL: {url}")
 
     commit_all("CYD dashboard with seasonal fish tank and self-update")
