@@ -294,10 +294,12 @@ void updateCorgi(Corgi &c, float dt) {
   switch (c.state) {
     case WALK:
       c.animT += dt * 7;
+      if (c.animT >= 4) c.animT -= 4;  // leg frames cycle 0-3; keep the counter small
       if (moveToward(c, 32, dt)) chooseNext(c);
       break;
     case ZOOMIES:
       c.animT += dt * 16;
+      if (c.animT >= 4) c.animT -= 4;
       if (moveToward(c, 150, dt)) {
         if (--c.zoomLaps <= 0) setState(c, STAND, frand(1.5f, 3));
         else {
@@ -306,14 +308,20 @@ void updateCorgi(Corgi &c, float dt) {
         }
       }
       break;
-    case CHASE:
+    case CHASE: {
       c.animT += dt * 14;
+      if (c.animT >= 4) c.animT -= 4;
       if (!ball.active || ball.holder) { setState(c, STAND, 1); break; }
       // Aim at the ball itself; the old mouth-offset target flipped with the facing
       c.tx = ball.x;
       c.ty = ball.y;
       moveToward(c, 115, dt);
-      if (fabsf(ball.x - mouthX(c)) < 12 && fabsf(ball.y - c.y) < 8 && ball.z < 4) {
+      // Grab it if it's at the mouth OR under the dog. A dog standing on the ball
+      // facing away used to wait forever, since it won't spin round for a tiny move.
+      // After 10 s of chasing it grabs the ball wherever it is, just in case.
+      bool atMouth = fabsf(ball.x - mouthX(c)) < 12, underfoot = fabsf(ball.x - c.x) < 16;
+      if (((atMouth || underfoot) && fabsf(ball.y - c.y) < 8 && ball.z < 4) || c.stateT > 10) {
+        Serial.printf("corgi: got the ball%s\n", c.stateT > 10 ? " (chase timeout)" : "");
         ball.holder = &c;
         c.hasBall = true;
         setState(c, FETCH, 99);
@@ -321,8 +329,10 @@ void updateCorgi(Corgi &c, float dt) {
         c.ty = YARD_BOTTOM;
       }
       break;
+    }
     case FETCH:
       c.animT += dt * 8;
+      if (c.animT >= 4) c.animT -= 4;
       if (moveToward(c, 45, dt)) {
         c.hasBall = false;
         ball.holder = nullptr;
@@ -374,6 +384,7 @@ void updateWeather(float dt) {
     for (auto &l : leaves) {
       if (!l.landed) {
         l.phase += dt * 3;
+        if (l.phase > 6.2832f) l.phase -= 6.2832f;
         l.y += l.vy * dt;
         l.x += sinf(l.phase) * 0.6f;
         if (l.y >= l.groundY) { l.landed = true; l.age = 0; }
@@ -386,6 +397,7 @@ void updateWeather(float dt) {
   } else if (season == SEASON_CHRISTMAS) {
     for (auto &f : snow) {
       f.phase += dt * 2;
+      if (f.phase > 6.2832f) f.phase -= 6.2832f;
       f.y += f.vy * dt;
       f.x += sinf(f.phase) * 0.3f;
       if (f.y > H) { f.y = -2; f.x = frand(0, W); }
@@ -717,6 +729,11 @@ void corgiFrame(const tm &t) {
   uint32_t now = millis();
   float dt = min(0.1f, (now - lastMs) / 1000.0f);
   simT += dt;
+  // Running full time for weeks: wrap the clock hourly so float timing stays precise
+  if (simT > 3600) {
+    simT -= 3600;
+    for (auto &c : corgis) c.blinkAt -= 3600;
+  }
   season = currentSeason(t);
   updateSky(t);
   for (auto &c : corgis) updateCorgi(c, dt);

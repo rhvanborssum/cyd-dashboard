@@ -117,12 +117,15 @@ static const bool INVERT_DEFAULT = false;
 #endif
 bool invertColours = INVERT_DEFAULT;
 bool corgisEnabled = false;
+int onlyScene = -1;  // >= 0: show just this scene, full time (no dashboard)
+uint32_t lastOtaMs = 0;
 
 void loadDeviceSettings() {
   Preferences p;
   p.begin("device", true);
   invertColours = p.getBool("invert", INVERT_DEFAULT);
   corgisEnabled = p.getBool("corgis", false);
+  onlyScene = p.getInt("only", -1);
   p.end();
 }
 
@@ -130,6 +133,13 @@ void saveDeviceSetting(const char *key, bool value) {
   Preferences p;
   p.begin("device", false);
   p.putBool(key, value);
+  p.end();
+}
+
+void saveOnlyScene(int i) {
+  Preferences p;
+  p.begin("device", false);
+  p.putInt("only", i);
   p.end();
 }
 
@@ -508,8 +518,8 @@ void setup() {
     tft.drawRoundRect(UI_X - 3, UI_Y - 3, UI_W + 6, UI_H + 6, 6, C_CARD);
     tft.setViewport(UI_X, UI_Y, UI_W, UI_H);
   }
-  Serial.printf("board: %s, invert %s, corgis %s\n", BOARD_NAME, invertColours ? "on" : "off",
-                corgisEnabled ? "on" : "off");
+  Serial.printf("board: %s, invert %s, corgis %s, only %s\n", BOARD_NAME, invertColours ? "on" : "off",
+                corgisEnabled ? "on" : "off", onlyScene >= 0 ? SCENES[onlyScene].name : "-");
 
   // Take over the backlight pin with PWM so it can be dimmed
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
@@ -560,6 +570,7 @@ void setup() {
 
   drawDashboard();
   modeStartMs = millis();
+  lastOtaMs = millis();
   Serial.printf("season: %s\n", seasonName(currentSeason(t)));
 }
 
@@ -624,6 +635,7 @@ void enterDashboard() {
 //   u = check for a firmware update now   v = print firmware version
 //   i = toggle colour inversion (saved)   k = toggle corgis in the rotation (saved)
 //   b = simulated tap (throw the ball / drop fish food)
+//   o = toggle corgis-only mode: corgis full time, no dashboard (saved)
 bool holdScreen = false;
 bool otaCheckRequested = false;
 
@@ -641,6 +653,13 @@ void handleSerial() {
         break;
       case 'b':  // simulated tap near the back of the screen (throws the ball / drops food)
         if (mode == MODE_SCENE) SCENES[scene].tap(160, 196);
+        break;
+      case 'o':
+        onlyScene = onlyScene >= 0 ? -1 : 1;
+        saveOnlyScene(onlyScene);
+        Serial.printf("corgis only: %s (saved)\n", onlyScene >= 0 ? "on" : "off");
+        if (onlyScene >= 0) enterScene(onlyScene);
+        else enterDashboard();
         break;
       case 'u': otaCheckRequested = true; break;
       case 'v': Serial.printf("firmware v%d\n", FW_VERSION); break;
@@ -664,6 +683,14 @@ void handleSerial() {
         break;
       }
     }
+  }
+}
+
+void maintainWifi(uint32_t ms) {
+  static uint32_t lastReconnectMs = 0;
+  if (!WiFi.isConnected() && ms - lastReconnectMs > 10000) {
+    lastReconnectMs = ms;
+    WiFi.reconnect();
   }
 }
 
@@ -692,8 +719,24 @@ void loop() {
   if (mode == MODE_SCENE) {
     if (tapped) SCENES[scene].tap(tx, ty);
     SCENES[scene].frame(t);
+    if (onlyScene >= 0) {
+      // Full-time scene: there's no dashboard stretch, so check for updates
+      // and keep Wi-Fi alive from here (the brief pause is every 6 hours)
+      if (otaCheckRequested || millis() - lastOtaMs >= OTA_INTERVAL_MS) {
+        otaCheckRequested = false;
+        lastOtaMs = millis();
+        otaCheckForUpdate(tft);  // reboots if it installs something
+      }
+      maintainWifi(ms);
+      return;
+    }
     if (millis() - modeStartMs >= SCENE_MS) enterDashboard();
     return;  // no network work while animating, so frames never stall
+  }
+
+  if (onlyScene >= 0) {
+    enterScene(onlyScene);
+    if (mode == MODE_SCENE) return;
   }
 
   if (tapped || ms - modeStartMs >= DASHBOARD_MS) {
@@ -702,7 +745,6 @@ void loop() {
   }
 
   // Update checks run on the dashboard, when the scenes' RAM is free
-  static uint32_t lastOtaMs = millis();
   if (otaCheckRequested || millis() - lastOtaMs >= OTA_INTERVAL_MS) {
     otaCheckRequested = false;
     lastOtaMs = millis();
@@ -738,10 +780,6 @@ void loop() {
     drawTicker();
   }
 
-  static uint32_t lastReconnectMs = 0;
-  if (!WiFi.isConnected() && ms - lastReconnectMs > 10000) {
-    lastReconnectMs = ms;
-    WiFi.reconnect();
-  }
+  maintainWifi(ms);
   delay(20);
 }
