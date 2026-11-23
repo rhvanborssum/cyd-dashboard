@@ -23,6 +23,7 @@
 #include "corgis.h"
 #include "season.h"
 #include "ota.h"
+#include "ota_config.h"
 #include "version.h"
 #include "wifi_store.h"
 
@@ -140,9 +141,12 @@ void loadDeviceSettings() {
   if (p.isKey("tz")) tzInfo = p.getString("tz");
   birthMonth = p.getUChar("bmon", 0);
   birthDay = p.getUChar("bday", 0);
+  otaSetChannel(p.isKey("chan") ? p.getString("chan") : String());
   p.end();
   setBirthday(birthMonth, birthDay);
 }
+
+void checkForUpdates();  // defined below
 
 const char *apName() { return onlyScene == 1 ? "Corgi-Yard" : "CYD-Dashboard"; }
 
@@ -595,7 +599,7 @@ void setup() {
   while (!getLocalTime(&t, 1000)) Serial.println("waiting for NTP");
 
   showMessage("Connected", WiFi.SSID(), "Checking for updates...");
-  otaCheckForUpdate(tft);
+  checkForUpdates();
 #endif
 
 #if !TOUCH_ON_TFT_BUS
@@ -675,7 +679,7 @@ void enterDashboard() {
 //   L29.7604,-95.3698  home location for real weather     Z<POSIX TZ>  time zone, e.g. ZEST5EDT,M3.2.0,M11.1.0
 //   R07-15  Roux's birthday (R0 = unknown)                 S<n>  try season n from season.h, S-1 = calendar (not saved)
 //   W63,55  pretend weather code,tempF (not saved)          W-1   back to real weather
-//   ?  print this board's settings
+//   C<name>  update channel, e.g. Ccorgi (C- = default)  ?  print this board's settings
 //   o = toggle corgis-only mode: corgis full time, no dashboard (saved)
 bool holdScreen = false;
 bool otaCheckRequested = false;
@@ -786,9 +790,28 @@ void handleSerial() {
         }
         break;
       }
+      case 'C': {
+        String v = Serial.readStringUntil('\n');
+        v.trim();
+        if (v == "-") v = "";
+        for (size_t i = 0; i < v.length(); i++)
+          if (!isalnum((unsigned char)v[i]) && v[i] != '-') {
+            Serial.println("usage: C<letters/digits>, C- for the default");
+            v = otaChannel();
+            break;
+          }
+        otaSetChannel(v);
+        Preferences p;
+        p.begin("device", false);
+        p.putString("chan", v);
+        p.end();
+        Serial.printf("update channel: %s (saved)\n", v.length() ? v.c_str() : "default");
+        break;
+      }
       case '?':
-        Serial.printf("firmware v%d, board %s, invert %s, corgis %s, only %d\n", FW_VERSION, BOARD_NAME,
-                      invertColours ? "on" : "off", corgisEnabled ? "on" : "off", onlyScene);
+        Serial.printf("firmware v%d, board %s, invert %s, corgis %s, only %d, channel %s\n", FW_VERSION, BOARD_NAME,
+                      invertColours ? "on" : "off", corgisEnabled ? "on" : "off", onlyScene,
+                      otaChannel().length() ? otaChannel().c_str() : "default");
         Serial.printf("home: %.4f, %.4f  tz: %s  birthday: %d-%d\n", homeLat, homeLon, tzInfo.c_str(), birthMonth,
                       birthDay);
         break;
@@ -810,6 +833,66 @@ void updateYardWeather() {
   bool ok = WiFi.isConnected() && fetchYardWeather();
   lastYardWxMs = ok ? millis() : millis() - YARD_WX_INTERVAL_MS + 2 * 60 * 1000;  // retry in 2 min
   yardWxDue = false;
+}
+
+// Remote settings for a board on an update channel: boards/<channel>.json in
+// the repo, e.g. {"birthday": "07-15", "lat": 46.15, "lon": -103.62,
+// "tz": "CST6CDT,M3.2.0,M11.1.0"}. Keys that are present replace what the
+// board has (and are saved); missing keys leave it alone. "birthday": "" clears.
+void fetchRemoteSettings() {
+  if (!otaChannel().length() || !WiFi.isConnected()) return;
+  JsonDocument doc;
+  if (!otaFetchJson(String(OTA_SETTINGS_URL) + otaChannel() + ".json", doc)) return;
+  Preferences p;
+  p.begin("device", false);
+  bool changed = false;
+  if (doc["lat"].is<float>() && doc["lon"].is<float>()) {
+    float lat = doc["lat"], lon = doc["lon"];
+    if (fabsf(lat - homeLat) > 0.0001f || fabsf(lon - homeLon) > 0.0001f) {
+      homeLat = lat;
+      homeLon = lon;
+      p.putFloat("lat", lat);
+      p.putFloat("lon", lon);
+      yardWxDue = true;
+      changed = true;
+    }
+  }
+  if (doc["tz"].is<const char *>()) {
+    String tz = doc["tz"].as<const char *>();
+    tz.trim();
+    if (tz.length() && tz != tzInfo) {
+      tzInfo = tz;
+      p.putString("tz", tz);
+      setenv("TZ", tz.c_str(), 1);
+      tzset();
+      changed = true;
+    }
+  }
+  if (doc["birthday"].is<const char *>()) {
+    String b = doc["birthday"].as<const char *>();
+    int dash = b.indexOf('-');
+    int m = b.toInt(), d = dash >= 0 ? b.substring(dash + 1).toInt() : 0;
+    if (m < 1 || m > 12 || d < 1 || d > 31) m = d = 0;
+    if (m != birthMonth || d != birthDay) {
+      birthMonth = m;
+      birthDay = d;
+      p.putUChar("bmon", m);
+      p.putUChar("bday", d);
+      setBirthday(m, d);
+      changed = true;
+    }
+  }
+  p.end();
+  Serial.printf("remote settings (%s): %s\n", otaChannel().c_str(), changed ? "updated" : "no change");
+  if (changed)
+    Serial.printf("home: %.4f, %.4f  tz: %s  birthday: %d-%d\n", homeLat, homeLon, tzInfo.c_str(), birthMonth,
+                  birthDay);
+}
+
+// At boot and every 6 hours: remote settings first, then firmware (which may reboot)
+void checkForUpdates() {
+  fetchRemoteSettings();
+  otaCheckForUpdate(tft);
 }
 
 void maintainWifi(uint32_t ms) {
@@ -851,7 +934,7 @@ void loop() {
       if (otaCheckRequested || millis() - lastOtaMs >= OTA_INTERVAL_MS) {
         otaCheckRequested = false;
         lastOtaMs = millis();
-        otaCheckForUpdate(tft);  // reboots if it installs something
+        checkForUpdates();  // reboots if it installs something
       }
       updateYardWeather();  // a brief pause every 15 minutes
       maintainWifi(ms);
@@ -875,7 +958,7 @@ void loop() {
   if (otaCheckRequested || millis() - lastOtaMs >= OTA_INTERVAL_MS) {
     otaCheckRequested = false;
     lastOtaMs = millis();
-    otaCheckForUpdate(tft);  // reboots if it installs something
+    checkForUpdates();  // reboots if it installs something
     drawDashboard();
   }
 

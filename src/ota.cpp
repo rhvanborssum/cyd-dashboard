@@ -27,6 +27,29 @@ void screen(TFT_eSPI &tft, const String &title, const String &line, uint16_t tit
 
 bool otaEnabled() { return sizeof(OTA_RELEASES_URL) > 1; }
 
+static String channel;
+void otaSetChannel(const String &c) { channel = c; }
+const String &otaChannel() { return channel; }
+
+bool otaFetchJson(const String &url, JsonDocument &doc) {
+  WiFiClientSecure client;
+  client.setCACert(OTA_ROOT_CAS);
+  HTTPClient http;
+  http.setTimeout(15000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("ota: %s -> %d\n", url.c_str(), code);
+    http.end();
+    return false;
+  }
+  DeserializationError err = deserializeJson(doc, http.getString());
+  http.end();
+  if (err) Serial.printf("ota: bad JSON in %s\n", url.c_str());
+  return !err;
+}
+
 void otaBootCheck() {
   Preferences p;
   p.begin("ota", false);
@@ -67,37 +90,17 @@ void otaCheckForUpdate(TFT_eSPI &tft) {
   if (!otaEnabled() || !WiFi.isConnected()) return;
 
   // 1. Manifest (github.com redirects to its release-asset host; both verified)
-  int latest = 0;
-  String url;
-  {
-    WiFiClientSecure client;
-    client.setCACert(OTA_ROOT_CAS);
-    HTTPClient http;
-    http.setTimeout(15000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!http.begin(client, OTA_RELEASES_URL OTA_MANIFEST_NAME)) return;
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-      Serial.printf("ota: manifest fetch -> %d\n", code);
-      http.end();
-      return;
-    }
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, http.getString());
-    http.end();
-    if (err) {
-      Serial.println("ota: bad manifest");
-      return;
-    }
-    latest = doc["version"] | 0;
-    url = doc["url"] | "";
-  }
+  String manifest = channel.length() ? "manifest-" + channel + ".json" : String(OTA_MANIFEST_NAME);
+  JsonDocument doc;
+  if (!otaFetchJson(String(OTA_RELEASES_URL) + manifest, doc)) return;
+  int latest = doc["version"] | 0;
+  String url = doc["url"] | "";
 
   Preferences p;
   p.begin("ota", true);
   int bad = p.getInt("bad", 0);
   p.end();
-  Serial.printf("ota: running v%d, latest v%d\n", FW_VERSION, latest);
+  Serial.printf("ota: running v%d, latest v%d (%s)\n", FW_VERSION, latest, manifest.c_str());
   if (latest <= FW_VERSION || url.isEmpty()) return;
   if (latest == bad) {
     Serial.printf("ota: v%d was rolled back before, skipping\n", latest);
